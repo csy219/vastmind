@@ -5,6 +5,16 @@ export type Decision =
   | { kind: 'ask'; reason: string }
   | { kind: 'deny'; reason: string };
 
+export type PermissionMode = 'default' | 'acceptEdits' | 'plan';
+
+export interface PermissionPolicy {
+  mode: PermissionMode;
+  allow: string[]; // 例：'run(npm test:*)'、'write'
+  deny: string[];  // 例：'run(npm publish:*)'
+}
+
+export const DEFAULT_POLICY: PermissionPolicy = { mode: 'default', allow: [], deny: [] };
+
 export interface PermissionRequest {
   tool: string;
   sideEffect: SideEffect;
@@ -25,16 +35,55 @@ const DENY: Array<{ re: RegExp; reason: string }> = [
   { re: /\bgit\s+clean\s+-\S*f/, reason: '删除未跟踪文件' },
 ];
 
-export function checkPermission(req: PermissionRequest): Decision {
-  if (req.sideEffect === 'none') return { kind: 'allow' };
+const CHAIN = /[;&|`\r\n<>]|\$\(/; // 串联、管道、重定向、命令替换
 
+function commandOf(req: PermissionRequest): string {
+  return String((req.args as { command?: unknown }).command ?? '').trim();
+}
+
+function matchPrefix(command: string, pattern: string): boolean {
+  if (pattern.endsWith(':*')) {
+    const prefix = pattern.slice(0, -2);
+    return command === prefix || command.startsWith(prefix + ' ');
+  }
+  return command === pattern;
+}
+
+// kind='deny' 时按串联拆开逐段匹配（尽量多拦）；kind='allow' 时命令里有串联就不匹配（尽量少放）。
+function matchRule(rule: string, req: PermissionRequest, kind: 'allow' | 'deny'): boolean {
+  const m = /^(\w+)(?:\((.*)\))?$/.exec(rule.trim());
+  if (!m || m[1] !== req.tool) return false;
+  const pattern = m[2];
+  if (pattern === undefined) return true;        // 规则作用于整个工具
+  if (req.tool !== 'run') return false;          // v1：带参数的规则只支持 run
+
+  const command = commandOf(req);
+  if (kind === 'allow') return !CHAIN.test(command) && matchPrefix(command, pattern);
+  return command.split(/[;&|\r\n`]+|\$\(/).some((seg) => matchPrefix(seg.trim(), pattern));
+}
+
+export function checkPermission(
+  req: PermissionRequest,
+  policy: PermissionPolicy = DEFAULT_POLICY,
+): Decision {
   if (req.tool === 'run') {
-    const command = String((req.args as { command?: unknown }).command ?? '');
+    const command = commandOf(req);
     for (const rule of DENY) {
       if (rule.re.test(command)) return { kind: 'deny', reason: rule.reason };
     }
-    return { kind: 'ask', reason: `执行命令：${command}` };
   }
+  if (policy.deny.some((r) => matchRule(r, req, 'deny'))) {
+    return { kind: 'deny', reason: '命中拒绝规则' };
+  }
+  if (req.sideEffect === 'none') return { kind: 'allow' };
 
-  return { kind: 'ask', reason: `写入：${req.tool}` };
+  if (policy.mode === 'plan') {
+    return { kind: 'deny', reason: '计划模式只读，不允许写入或执行命令' };
+  }
+  if (policy.allow.some((r) => matchRule(r, req, 'allow'))) return { kind: 'allow' };
+  if (policy.mode === 'acceptEdits' && req.sideEffect === 'write') return { kind: 'allow' };
+
+  return req.tool === 'run'
+    ? { kind: 'ask', reason: `执行命令：${commandOf(req)}` }
+    : { kind: 'ask', reason: `写入：${req.tool}` };
 }

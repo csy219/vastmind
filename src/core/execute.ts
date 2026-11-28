@@ -1,6 +1,6 @@
 import { getTool } from '../tools/registry.js';
 import type { ToolContext, ToolResult } from '../tools/types.js';
-import { checkPermission } from './permission.js';
+import { checkPermission, DEFAULT_POLICY, type PermissionPolicy } from './permission.js';
 
 export type Approver = (reason: string) => Promise<boolean>;
 
@@ -11,6 +11,7 @@ export async function executeTool(
   rawArgs: unknown,
   ctx: ToolContext,
   approve: Approver,
+  policy: PermissionPolicy = DEFAULT_POLICY,
 ): Promise<ToolResult> {
   const tool = getTool(name);
   if (!tool) return { ok: false, status: 'error', summary: `未知工具：${name}` };
@@ -23,7 +24,7 @@ export async function executeTool(
     return { ok: false, status: 'error', summary: `参数无效：${msg}` };
   }
 
-  const decision = checkPermission({ tool: tool.name, sideEffect: tool.sideEffect, args: parsed.data });
+  const decision = checkPermission({ tool: tool.name, sideEffect: tool.sideEffect, args: parsed.data }, policy);
   if (decision.kind === 'deny') return denied(`已拒绝：${decision.reason}`);
   if (decision.kind === 'ask' && !(await approve(decision.reason))) return denied('用户未批准');
 
